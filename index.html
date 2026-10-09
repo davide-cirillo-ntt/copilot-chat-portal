@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Chat</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --fg:#e6edf3; --muted:#8b949e; --me:#1f6feb; --bot:#21262d; --border:#30363d; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--fg); height:100vh; height:100dvh; display:flex; flex-direction:column; }
+  header { padding:12px 16px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; }
+  header h1 { font-size:16px; margin:0; }
+  header span { color:var(--muted); font-size:12px; }
+  #login, #chat { flex:1; display:flex; flex-direction:column; min-height:0; }
+  #login { align-items:center; justify-content:center; gap:12px; padding:16px; }
+  #chat { display:none; }
+  #messages { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:10px; }
+  .msg { max-width:80%; padding:10px 14px; border-radius:12px; white-space:pre-wrap; word-wrap:break-word; line-height:1.4; }
+  .me { align-self:flex-end; background:var(--me); color:#fff; }
+  .bot { align-self:flex-start; background:var(--bot); border:1px solid var(--border); }
+  .time { display:block; font-size:11px; opacity:.6; margin-top:4px; }
+  .pending { align-self:flex-start; color:var(--muted); font-style:italic; font-size:13px; }
+  form { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
+  textarea, input { flex:1; background:var(--bg); color:var(--fg); border:1px solid var(--border); border-radius:8px; padding:10px; font:inherit; }
+  textarea { resize:none; height:48px; }
+  button { background:#238636; color:#fff; border:0; border-radius:8px; padding:0 18px; font:inherit; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  #login input { width:min(360px, 90vw); flex:none; }
+  #login button { height:42px; width:min(360px, 90vw); }
+  #err { color:#f85149; min-height:1.2em; font-size:14px; }
+</style>
+</head>
+<body>
+<header><h1>💬 Chat con Copilot</h1><span id="status"></span></header>
+
+<div id="login">
+  <input id="pw" type="password" placeholder="Password" autocomplete="current-password" autofocus>
+  <button id="go">Entra</button>
+  <div id="err"></div>
+</div>
+
+<div id="chat">
+  <div id="messages"></div>
+  <form id="f">
+    <textarea id="t" placeholder="Scrivi un messaggio… (Invio per inviare, Shift+Invio per andare a capo)"></textarea>
+    <button id="send">Invia</button>
+  </form>
+</div>
+
+<script>
+const CONFIG = {
+  owner: "davide-cirillo-ntt",
+  repo: "copilot-chat-inbox",
+  issue: 1,
+  pollSeconds: 15,
+  // Generated locally by setup.html (AES-GCM-256, key derived with PBKDF2-SHA256)
+  encrypted: {"v":1,"iterations":1000000,"salt":"9HehBIqjZcYFWBrXF6F0HA==","iv":"LMKc0yLDCR53qcdm","ct":"QsMCYjQO8CJVTTuHSmHZrJxlqTOomyBHsjkVx7/AIbc7nci65dcbR8zWqzlp9/At72Dd4DWU65kP/kB8HfPLe9QqKdgTK1E/B156XJ+IJjEDdw50BvKzUQIBdEFfbCYkEyHljQ9BKncJeeidkw=="}
+};
+const USER_MARK = "<!-- portal:user -->";
+const BOT_MARK = "<!-- portal:copilot -->";
+const API = `https://api.github.com/repos/${CONFIG.owner}/${CONFIG.repo}/issues/${CONFIG.issue}/comments`;
+let token = null, pollTimer = null, lastRender = "";
+
+const $ = id => document.getElementById(id);
+const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+async function decryptToken(password) {
+  const e = CONFIG.encrypted;
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: b64(e.salt), iterations: e.iterations, hash: "SHA-256" },
+    base, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64(e.iv) }, key, b64(e.ct));
+  return new TextDecoder().decode(pt);
+}
+
+async function gh(url, opts = {}) {
+  const r = await fetch(url, { ...opts, headers: {
+    "Authorization": `Bearer ${token}`, "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28", ...(opts.headers || {}) } });
+  if (r.status === 401) { logout("Token non valido o scaduto."); throw new Error("401"); }
+  if (!r.ok) throw new Error(`GitHub ${r.status}`);
+  return r;
+}
+
+async function loadComments() {
+  let all = [], page = 1;
+  while (true) {
+    const r = await gh(`${API}?per_page=100&page=${page}`, { cache: "no-store" });
+    const batch = await r.json();
+    all = all.concat(batch);
+    if (batch.length < 100) break;
+    page++;
+  }
+  return all.filter(c => c.body.startsWith(USER_MARK) || c.body.startsWith(BOT_MARK));
+}
+
+function render(comments) {
+  const key = comments.map(c => c.id + ":" + c.updated_at).join(",");
+  if (key === lastRender) return;
+  lastRender = key;
+  const box = $("messages");
+  box.innerHTML = "";
+  for (const c of comments) {
+    const mine = c.body.startsWith(USER_MARK);
+    const div = document.createElement("div");
+    div.className = "msg " + (mine ? "me" : "bot");
+    div.textContent = c.body.slice((mine ? USER_MARK : BOT_MARK).length).trim();
+    const t = document.createElement("span");
+    t.className = "time";
+    t.textContent = new Date(c.created_at).toLocaleString("it-IT");
+    div.appendChild(t);
+    box.appendChild(div);
+  }
+  const last = comments[comments.length - 1];
+  if (last && last.body.startsWith(USER_MARK)) {
+    const p = document.createElement("div");
+    p.className = "pending";
+    p.textContent = "In attesa di risposta (può richiedere qualche minuto)…";
+    box.appendChild(p);
+  }
+  box.scrollTop = box.scrollHeight;
+}
+
+async function refresh() {
+  try {
+    render(await loadComments());
+    $("status").textContent = "Aggiornato " + new Date().toLocaleTimeString("it-IT");
+  } catch (e) {
+    if (e.message !== "401") $("status").textContent = "Errore di connessione, riprovo…";
+  }
+}
+
+async function login(password) {
+  $("err").textContent = "";
+  $("go").disabled = true;
+  try {
+    token = await decryptToken(password);
+  } catch {
+    token = null;
+    $("err").textContent = "Password errata.";
+    $("go").disabled = false;
+    return;
+  }
+  sessionStorage.setItem("pw", password);
+  $("login").style.display = "none";
+  $("chat").style.display = "flex";
+  $("go").disabled = false;
+  await refresh();
+  pollTimer = setInterval(refresh, CONFIG.pollSeconds * 1000);
+  $("t").focus();
+}
+
+function logout(msg) {
+  token = null; clearInterval(pollTimer); sessionStorage.removeItem("pw");
+  $("chat").style.display = "none"; $("login").style.display = "flex";
+  $("err").textContent = msg || "";
+}
+
+$("go").onclick = () => login($("pw").value);
+$("pw").onkeydown = e => { if (e.key === "Enter") login($("pw").value); };
+$("t").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("f").requestSubmit(); } };
+$("f").onsubmit = async e => {
+  e.preventDefault();
+  const text = $("t").value.trim();
+  if (!text) return;
+  $("send").disabled = true;
+  try {
+    await gh(API, { method: "POST", body: JSON.stringify({ body: `${USER_MARK}\n${text}` }) });
+    $("t").value = "";
+    await refresh();
+  } catch (err) {
+    if (err.message !== "401") alert("Invio non riuscito: " + err.message);
+  } finally { $("send").disabled = false; }
+};
+
+const saved = sessionStorage.getItem("pw");
+if (saved) login(saved);
+</script>
+</body>
+</html>
